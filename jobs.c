@@ -26,8 +26,73 @@ static void sigchld_handler(int sig) {
   int status;
   /* TODO: Change state (FINISHED, RUNNING, STOPPED) of processes and jobs.
    * Bury all children that finished saving their status in jobs. */
-  (void)status;
-  (void)pid;
+
+  while ((pid = waitpid(-1, &status, WUNTRACED | WNOHANG | WCONTINUED)) > 0) {
+    bool done = false;
+    int numbJob = 0;
+    for (int i = 0; i < njobmax; i++) {
+      if (done)
+        break;
+      struct job *job = &jobs[i];
+      for (int k = 0; k < job->nproc; k++) {
+        if (done)
+          break;
+        struct proc *proc = &job->proc[k];
+        if (proc->pid == pid) {
+          numbJob = i;
+          done = true;
+          if (WIFSTOPPED(status)) {
+            proc->state = STOPPED;
+            proc->exitcode = status;
+          } else if (WIFEXITED(status)) {
+            proc->state = FINISHED;
+            proc->exitcode = status;
+          } else if (WIFSIGNALED(status)) {
+            proc->state = FINISHED;
+            proc->exitcode = status;
+          } else if (WIFCONTINUED(status)) {
+            proc->state = RUNNING;
+            proc->exitcode = status;
+          }
+        }
+      }
+    }
+    unsigned int mask = 0;
+    job_t *job = &jobs[numbJob];
+    for (int i = 0; i < job->nproc; i++) {
+      switch (job->proc[i].state) {
+        case FINISHED: {
+          mask = mask | 1;
+          break;
+        }
+        case STOPPED: {
+          mask = mask | 2;
+          break;
+        }
+        case RUNNING: {
+          mask = mask | 4;
+          break;
+        }
+      }
+    }
+    switch (mask) {
+      case 1: {
+        job->state = FINISHED;
+        break;
+      }
+      case 2: {
+        job->state = STOPPED;
+        break;
+      }
+      case 4: {
+        job->state = RUNNING;
+        break;
+      }
+      default: {
+        break;
+      }
+    }
+  }
   errno = old_errno;
 }
 
@@ -96,7 +161,6 @@ static void mkcommand(char **cmdp, char **argv) {
 void addproc(int j, pid_t pid, char **argv) {
   assert(j < njobmax);
   job_t *job = &jobs[j];
-
   int p = allocproc(j);
   proc_t *proc = &job->proc[p];
   /* Initial state of a process. */
@@ -114,7 +178,10 @@ int jobstate(int j, int *statusp) {
   int state = job->state;
 
   /* TODO: Handle case where job has finished. */
-  (void)exitcode;
+  if (state == FINISHED) {
+    *statusp = exitcode(job);
+    deljob(job);
+  }
 
   return state;
 }
@@ -137,8 +204,28 @@ bool resumejob(int j, int bg, sigset_t *mask) {
     return false;
 
   /* TODO: Continue stopped job. Possibly move job to foreground slot. */
-  (void)movejob;
-
+  if (Tcgetpgrp(tty_fd) != getpgrp() || jobs[0].pgid != 0) {
+    msg("No task control!\n");
+    return false;
+  }
+  if (!bg) {
+    movejob(j, 0);
+    Tcsetpgrp(tty_fd, jobs[0].pgid);
+    Tcsetattr(tty_fd, 0, &jobs[0].tmodes);
+    if (jobs[0].state == STOPPED) {
+      Kill(-jobs[0].pgid, SIGCONT);
+      while (jobs[0].state == STOPPED) {
+        sigsuspend(mask);
+      }
+    }
+    msg("[%d] continue '%s'\n", j, jobcmd(0));
+    monitorjob(mask);
+  } else {
+    if (jobs[j].state == STOPPED) {
+      Kill(-jobs[j].pgid, SIGCONT);
+      msg("[%d] continue '%s'\n", j, jobcmd(j));
+    }
+  }
   return true;
 }
 
@@ -149,7 +236,9 @@ bool killjob(int j) {
   debug("[%d] killing '%s'\n", j, jobs[j].command);
 
   /* TODO: I love the smell of napalm in the morning. */
-
+  kill(-jobs[j].pgid, SIGTERM);
+  if (jobs[j].state == STOPPED)
+    kill(-jobs[j].pgid, SIGCONT);
   return true;
 }
 
@@ -160,7 +249,29 @@ void watchjobs(int which) {
       continue;
 
     /* TODO: Report job number, state, command and exit code or signal. */
-    (void)deljob;
+    int status;
+    char *cmd = strdup(jobcmd(j));
+    int jobstat = jobstate(j, &status);
+    switch (which) {
+      case ALL: {
+        if (jobstat == FINISHED)
+          WIFEXITED(status)
+        ? printf("[%d] exited '%s', status=%d\n", j, cmd, WEXITSTATUS(status))
+        : printf("[%d] killed '%s' by signal %d\n", j, cmd, WTERMSIG(status));
+        else if (jobstat == STOPPED) printf("[%d] suspended '%s'\n", j, cmd);
+        else printf("[%d] running '%s'\n", j, cmd);
+        break;
+      }
+      case FINISHED: {
+        if (jobstat == FINISHED) {
+          WIFEXITED(status)
+          ? printf("[%d] exited '%s', status=%d\n", j, cmd, WEXITSTATUS(status))
+          : printf("[%d] killed '%s' by signal %d\n", j, cmd, WTERMSIG(status));
+          break;
+        }
+      }
+    }
+    free(cmd);
   }
 }
 
@@ -170,9 +281,20 @@ int monitorjob(sigset_t *mask) {
   int exitcode = 0, state;
 
   /* TODO: Following code requires use of Tcsetpgrp of tty_fd. */
-  (void)exitcode;
-  (void)state;
-
+  Tcsetpgrp(tty_fd, jobs[0].pgid);
+  while ((state = jobstate(0, &exitcode)) == RUNNING) {
+    sigsuspend(mask);
+  }
+  if (state == STOPPED) {
+    Tcgetattr(tty_fd, &jobs[0].tmodes);
+    int to = allocjob();
+    movejob(0, to);
+    msg("[%d] suspended '%s'\n", to, jobcmd(to));
+  }
+  if (state != RUNNING) {
+    Tcsetattr(tty_fd, 0, &shell_tmodes);
+    Tcsetpgrp(tty_fd, getpgrp());
+  }
   return exitcode;
 }
 
@@ -200,9 +322,12 @@ void shutdownjobs(void) {
   Sigprocmask(SIG_BLOCK, &sigchld_mask, &mask);
 
   /* TODO: Kill remaining jobs and wait for them to finish. */
+  for (int i = 1; i < njobmax; i++)
+    if (killjob(i))
+      while (jobs[i].state != FINISHED)
+        sigsuspend(&mask);
 
   watchjobs(FINISHED);
-
   Sigprocmask(SIG_SETMASK, &mask, NULL);
 
   Close(tty_fd);

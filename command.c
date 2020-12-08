@@ -112,6 +112,16 @@ noreturn void external_command(char **argv) {
 
   if (!index(argv[0], '/') && path) {
     /* TODO: For all paths in PATH construct an absolute path and execve it. */
+    while (*path) {
+      size_t length = strcspn(path, ":");
+      char *direct = strndup(path, length);
+      strapp(&direct, "/");
+      strapp(&direct, argv[0]);
+      execve(direct, argv, environ);
+      free(direct);
+      path += length + (length != strlen(path));
+    }
+
   } else {
     (void)execve(argv[0], argv, environ);
   }

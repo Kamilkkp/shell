@@ -29,8 +29,23 @@ static int do_redir(token_t *token, int ntokens, int *inputp, int *outputp) {
 
   for (int i = 0; i < ntokens; i++) {
     /* TODO: Handle tokens and open files as requested. */
-    (void)mode;
-    (void)MaybeClose;
+    if (token[i] == T_INPUT) {
+      if (!mode)
+        n = i;
+      mode = token[i];
+      MaybeClose(inputp);
+      *inputp = Open(token[i + 1], O_RDONLY, 0);
+    } else if (token[i] == T_OUTPUT) {
+      if (!mode)
+        n = i;
+      mode = token[i];
+      MaybeClose(outputp);
+      *outputp = Open(token[i + 1], O_WRONLY | O_CREAT,
+                      S_IWUSR | S_IRUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    } else if (!mode)
+      n++;
+    else
+      token[i] = T_NULL;
   }
 
   token[n] = NULL;
@@ -54,6 +69,36 @@ static int do_job(token_t *token, int ntokens, bool bg) {
   Sigprocmask(SIG_BLOCK, &sigchld_mask, &mask);
 
   /* TODO: Start a subprocess, create a job and monitor it. */
+  pid_t pid = fork();
+  if (pid) {
+    setpgid(pid, pid);
+    MaybeClose(&input);
+    MaybeClose(&output);
+    int job = addjob(pid, bg);
+    addproc(job, pid, token);
+    if (!bg) {
+      exitcode = monitorjob(&mask);
+    } else {
+      msg("[%d] running '%s'\n", job, jobcmd(job));
+    }
+  } else {
+    Signal(SIGINT, SIG_DFL);
+    Signal(SIGTSTP, SIG_DFL);
+    Signal(SIGTTIN, SIG_DFL);
+    Signal(SIGTTOU, SIG_DFL);
+    Sigprocmask(SIG_SETMASK, &mask, NULL);
+    setpgrp();
+    if (input)
+      dup2(input, STDIN_FILENO);
+    if (output)
+      dup2(output, STDOUT_FILENO);
+
+    MaybeClose(&input);
+    MaybeClose(&output);
+    if ((exitcode = builtin_command(token)) >= 0)
+      exit(exitcode);
+    external_command(token);
+  }
 
   Sigprocmask(SIG_SETMASK, &mask, NULL);
   return exitcode;
@@ -70,7 +115,28 @@ static pid_t do_stage(pid_t pgid, sigset_t *mask, int input, int output,
 
   /* TODO: Start a subprocess and make sure it's moved to a process group. */
   pid_t pid = Fork();
-
+  if (!pid) {
+    if (!pgid)
+      Setpgid(getpid(), getpid());
+    else
+      Setpgid(getpid(), pgid);
+    Signal(SIGINT, SIG_DFL);
+    Signal(SIGTSTP, SIG_DFL);
+    Signal(SIGTTIN, SIG_DFL);
+    Signal(SIGTTOU, SIG_DFL);
+    Sigprocmask(SIG_SETMASK, mask, NULL);
+    if (input)
+      dup2(input, STDIN_FILENO);
+    if (output)
+      dup2(output, STDOUT_FILENO);
+    MaybeClose(&input);
+    MaybeClose(&output);
+    int exitcode;
+    if ((exitcode = builtin_command(token)) >= 0)
+      exit(exitcode);
+    external_command(token);
+  }
+  Setpgid(pid, pid);
   return pid;
 }
 
@@ -99,11 +165,47 @@ static int do_pipeline(token_t *token, int ntokens, bool bg) {
 
   /* TODO: Start pipeline subprocesses, create a job and monitor it.
    * Remember to close unused pipe ends! */
-  (void)input;
-  (void)job;
-  (void)pid;
-  (void)pgid;
-  (void)do_stage;
+  size_t length = 0;
+  for (size_t i = 0; i < ntokens; i++) {
+    if (token[i] == T_PIPE) {
+      length = i;
+      break;
+    }
+  }
+  pid = do_stage(pgid, &mask, input, output, token, length);
+  MaybeClose(&output);
+  pgid = pid;
+  job = addjob(pgid, bg);
+  addproc(job, pid, token);
+  token = &token[length + 1];
+  ntokens -= (length + 1);
+  input = next_input;
+  while (true) {
+    for (size_t i = 0; i < ntokens; i++) {
+      if (token[i] == T_PIPE) {
+        length = i;
+        mkpipe(&next_input, &output);
+        break;
+      } else
+        length = ntokens;
+    }
+    pid = do_stage(pgid, &mask, input, output, token, length);
+    MaybeClose(&input);
+    MaybeClose(&output);
+    addproc(job, pid, token);
+    input = next_input;
+    ntokens -= (length + 1);
+    if (ntokens > 0)
+      token = &token[length + 1];
+    else
+      break;
+  }
+
+  if (!bg) {
+    exitcode = monitorjob(&mask);
+  } else {
+    msg("[%d] running '%s'\n", job, jobcmd(job));
+  }
 
   Sigprocmask(SIG_SETMASK, &mask, NULL);
   return exitcode;
